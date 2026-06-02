@@ -9,7 +9,7 @@ import { eq } from "drizzle-orm";
 import type { z } from "zod";
 import { type apiCreateDomain, domains } from "../db/schema";
 import { findApplicationById } from "./application";
-import { detectCDNProvider } from "./cdn";
+import { type CDNProvider, detectCDNProvider } from "./cdn";
 import { findServerById } from "./server";
 
 export type Domain = typeof domains.$inferSelect;
@@ -145,6 +145,57 @@ export const getDomainHost = (domain: Domain) => {
 };
 
 const resolveDns = promisify(dns.resolve4);
+const resolveCname = promisify(dns.resolveCname);
+const MAX_CNAME_LOOKUP_DEPTH = 5;
+
+const normalizeHostname = (hostname: string) =>
+	hostname.toLowerCase().replace(/\.$/, "");
+
+const detectCDNProviderFromCnameChain = async (
+	hostname: string,
+	visitedHostnames = new Set<string>(),
+	depth = 0,
+): Promise<CDNProvider | null> => {
+	const normalizedHostname = normalizeHostname(hostname);
+	if (
+		!normalizedHostname ||
+		visitedHostnames.has(normalizedHostname) ||
+		depth >= MAX_CNAME_LOOKUP_DEPTH
+	) {
+		return null;
+	}
+
+	visitedHostnames.add(normalizedHostname);
+
+	try {
+		const cnames = await resolveCname(normalizedHostname);
+
+		for (const cname of cnames) {
+			const cdnProvider = detectCDNProvider({
+				type: "hostname",
+				hostname: cname,
+			});
+			if (cdnProvider) {
+				return cdnProvider;
+			}
+		}
+
+		for (const cname of cnames) {
+			const cdnProvider = await detectCDNProviderFromCnameChain(
+				cname,
+				visitedHostnames,
+				depth + 1,
+			);
+			if (cdnProvider) {
+				return cdnProvider;
+			}
+		}
+	} catch {
+		return null;
+	}
+
+	return null;
+};
 
 export const validateDomain = async (
 	domain: string,
@@ -167,7 +218,7 @@ export const validateDomain = async (
 
 		// Check if any IP belongs to a CDN provider
 		const cdnProvider = ips
-			.map((ip) => detectCDNProvider(ip))
+			.map((ip) => detectCDNProvider({ type: "ip", ip }))
 			.find((provider) => provider !== null);
 
 		// If behind a CDN, we consider it valid but inform the user
@@ -177,6 +228,17 @@ export const validateDomain = async (
 				resolvedIp: resolvedIps.join(", "),
 				cdnProvider: cdnProvider.displayName,
 				error: cdnProvider.warningMessage,
+			};
+		}
+
+		const cnameCDNProvider = await detectCDNProviderFromCnameChain(cleanDomain);
+
+		if (cnameCDNProvider) {
+			return {
+				isValid: true,
+				resolvedIp: resolvedIps.join(", "),
+				cdnProvider: cnameCDNProvider.displayName,
+				error: cnameCDNProvider.warningMessage,
 			};
 		}
 
